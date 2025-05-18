@@ -16,7 +16,8 @@
         {urls: "stun:stun.l.google.com:19302"}  // STUN público do Google
       ]
     });
-    const ws = new WebSocket("wss://ava-luma-video.mnzgpf.easypanel.host/ws");
+    const protocol = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${protocol}://${location.host}/ws`);
     const localVideo = document.getElementById('local');
     const remoteVideo = document.getElementById('remote');
 
