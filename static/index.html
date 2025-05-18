@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Chamada 2 Pessoas</title>
+</head>
+
+<body>
+  <h1>Chamada de Vídeo</h1>
+  <video id="local" autoplay playsinline muted></video>
+  <video id="remote" autoplay playsinline></video>
+
+  <script>
+    const pc = new RTCPeerConnection();
+    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const localVideo = document.getElementById('local');
+    const remoteVideo = document.getElementById('remote');
+
+    navigator.mediaDevices.getUserMedia({video: true, audio: true})
+      .then(stream => {
+        localVideo.srcObject = stream;
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      });
+
+    pc.ontrack = event => {
+      remoteVideo.srcObject = event.streams[0];
+    };
+
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        ws.send(JSON.stringify({type: "candidate", data: JSON.stringify(event.candidate)}));
+      }
+    };
+
+    ws.onmessage = async ({data}) => {
+      const msg = JSON.parse(data);
+
+      if (msg.type === "offer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data)));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({type: "answer", data: JSON.stringify(answer)}));
+      }
+
+      if (msg.type === "answer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data)));
+      }
+
+      if (msg.type === "candidate") {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(JSON.parse(msg.data)));
+        } catch (e) {
+          console.error("Erro ao adicionar ICE:", e);
+        }
+      }
+    };
+
+    // Primeiro cliente inicia a oferta
+    ws.onopen = async () => {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({type: "offer", data: JSON.stringify(offer)}));
+    };
+  </script>
+</body>
+
+</html>
