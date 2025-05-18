@@ -93,7 +93,10 @@
     const iceServers = {
       iceServers: [
         {urls: 'stun:stun.l.google.com:19302'},
-        {urls: 'stun:stun1.l.google.com:19302'}
+        {urls: 'stun:stun1.l.google.com:19302'},
+        {urls: 'stun:stun2.l.google.com:19302'},
+        {urls: 'stun:stun3.l.google.com:19302'},
+        {urls: 'stun:stun4.l.google.com:19302'}
       ]
     };
 
@@ -126,14 +129,54 @@
 
         // Solicita acesso à câmera e microfone
         try {
-          localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+          // Tenta primeiro com restrições específicas para melhor compatibilidade
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: {ideal: 640},
+              height: {ideal: 480},
+              frameRate: {ideal: 30}
+            },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+
+          // Verifica se temos trilhas de mídia
+          const videoTracks = localStream.getVideoTracks();
+          const audioTracks = localStream.getAudioTracks();
+
+          console.log(`Obtidas ${videoTracks.length} trilhas de vídeo e ${audioTracks.length} trilhas de áudio`);
+
+          if (videoTracks.length > 0) {
+            console.log('Usando dispositivo de vídeo:', videoTracks[0].label);
+          }
+
+          if (audioTracks.length > 0) {
+            console.log('Usando dispositivo de áudio:', audioTracks[0].label);
+          }
+
           addVideoStream('local', localStream, 'Você');
           updateStatus('Mídia local iniciada');
         } catch (err) {
-          console.error('Erro ao acessar mídia:', err);
-          alert(`Não foi possível acessar câmera ou microfone: ${err.message}`);
-          resetJoinButton();
-          return;
+          console.error('Erro ao acessar mídia com configurações específicas:', err);
+
+          // Se falhar, tenta novamente com configurações básicas
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: true
+            });
+
+            addVideoStream('local', localStream, 'Você');
+            updateStatus('Mídia local iniciada (modo de compatibilidade)');
+          } catch (fallbackErr) {
+            console.error('Erro ao acessar mídia em modo de compatibilidade:', fallbackErr);
+            alert(`Não foi possível acessar câmera ou microfone: ${fallbackErr.message}`);
+            resetJoinButton();
+            return;
+          }
         }
 
         // Inicia a conexão WebSocket
@@ -242,6 +285,19 @@
     }
 
     function addVideoStream(id, stream, label = id) {
+      console.log(`Adicionando stream de vídeo para ${id} (${label})`, stream);
+
+      // Verifica se o stream existe e tem trilhas
+      if (!stream) {
+        console.error('Stream inválido recebido para:', id);
+        return;
+      }
+
+      // Exibe informações sobre as trilhas
+      stream.getTracks().forEach(track => {
+        console.log(`- Trilha ${track.kind} para ${id}: enabled=${track.enabled}, muted=${track.muted}, readyState=${track.readyState}`);
+      });
+
       // Cria container para o vídeo
       let container = document.querySelector(`.video-container[data-peer="${id}"]`);
 
@@ -267,6 +323,18 @@
 
       const video = container.querySelector('video');
       video.srcObject = stream;
+
+      // Verifica se há trilhas de vídeo antes de tentar reproduzir
+      if (stream.getVideoTracks().length > 0) {
+        console.log(`O stream para ${id} tem ${stream.getVideoTracks().length} trilhas de vídeo`);
+      } else {
+        console.warn(`O stream para ${id} não tem trilhas de vídeo!`);
+      }
+
+      // Tenta iniciar a reprodução e registra qualquer erro
+      video.play().catch(err => {
+        console.error(`Erro ao reproduzir vídeo para ${id}:`, err);
+      });
     }
 
     function createPeerConnection(peerID, isInitiator) {
@@ -284,13 +352,23 @@
 
       // Adiciona as trilhas locais à conexão
       localStream.getTracks().forEach(track => {
+        console.log('Adicionando trilha local à conexão peer:', track.kind);
         pc.addTrack(track, localStream);
       });
 
       // Manipula eventos da conexão peer
       pc.ontrack = (event) => {
-        console.log('Trilha recebida de:', peerID);
-        addVideoStream(peerID, event.streams[0], `Participante (${peerID})`);
+        console.log('Trilha recebida de:', peerID, 'tipo:', event.track.kind);
+        if (event.streams && event.streams[0]) {
+          console.log('Stream recebido com ID:', event.streams[0].id);
+          addVideoStream(peerID, event.streams[0], `Participante (${peerID})`);
+        } else {
+          console.warn('Recebido evento ontrack sem streams válidos');
+          // Criar um novo MediaStream se não vier com um
+          const newStream = new MediaStream();
+          newStream.addTrack(event.track);
+          addVideoStream(peerID, newStream, `Participante (${peerID})`);
+        }
       };
 
       pc.onicecandidate = (event) => {
@@ -306,11 +384,26 @@
 
       pc.oniceconnectionstatechange = () => {
         console.log('Estado da conexão ICE com', peerID, ':', pc.iceConnectionState);
+        updateStatus(`Conexão com ${peerID}: ${pc.iceConnectionState}`);
+
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          updateStatus(`Conectado com ${peerID} com sucesso!`);
+        }
+
         if (pc.iceConnectionState === 'disconnected' ||
           pc.iceConnectionState === 'failed' ||
           pc.iceConnectionState === 'closed') {
+          updateStatus(`Conexão com ${peerID} perdida: ${pc.iceConnectionState}`);
           closePeerConnection(peerID);
         }
+      };
+
+      pc.onsignalingstatechange = () => {
+        console.log('Estado de sinalização com', peerID, ':', pc.signalingState);
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log('Estado da conexão com', peerID, ':', pc.connectionState);
       };
 
       // Se for o iniciador, cria e envia uma oferta
@@ -329,8 +422,25 @@
           offerToReceiveVideo: true
         });
 
+        console.log('Oferta criada:', offer);
+
         await pc.setLocalDescription(offer);
         console.log('Definida descrição local (oferta)');
+
+        // Garantir que todos os candidatos ICE sejam coletados
+        await new Promise(resolve => {
+          if (pc.iceGatheringState === 'complete') {
+            resolve();
+          } else {
+            const checkState = () => {
+              if (pc.iceGatheringState === 'complete') {
+                pc.removeEventListener('icegatheringstatechange', checkState);
+                resolve();
+              }
+            };
+            pc.addEventListener('icegatheringstatechange', checkState);
+          }
+        });
 
         socket.send(JSON.stringify({
           type: 'offer',
@@ -394,8 +504,33 @@
 
       if (pc) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-          console.log('Candidato ICE adicionado de:', peerID);
+          // Verifica se o candidato é válido
+          if (msg.candidate) {
+            console.log('Adicionando candidato ICE recebido:', msg.candidate);
+
+            // Aguarda até que a descrição remota esteja definida antes de adicionar candidatos
+            if (pc.currentRemoteDescription) {
+              await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              console.log('Candidato ICE adicionado de:', peerID);
+            } else {
+              console.warn('Adiando adição de candidato ICE até que a descrição remota esteja definida');
+              // Aguarda um momento para a descrição remota ser definida
+              setTimeout(async () => {
+                if (pc.currentRemoteDescription) {
+                  try {
+                    await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                    console.log('Candidato ICE adicionado com atraso:', peerID);
+                  } catch (delayedErr) {
+                    console.error('Erro ao adicionar candidato ICE atrasado:', delayedErr);
+                  }
+                } else {
+                  console.error('Impossível adicionar candidato ICE: nenhuma descrição remota');
+                }
+              }, 1000);
+            }
+          } else {
+            console.warn('Recebido candidato ICE inválido de:', peerID);
+          }
         } catch (err) {
           console.error('Erro ao adicionar candidato ICE:', err);
         }

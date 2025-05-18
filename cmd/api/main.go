@@ -114,6 +114,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 						Type: "new-peer",
 						ID:   userID,
 					})
+					// Registra os participantes no console do servidor
+					fmt.Printf("Conectando usuários: %s e %s na sala %s\n", userID, peerID, roomID)
 				}
 			}
 			roomsMu.Unlock()
