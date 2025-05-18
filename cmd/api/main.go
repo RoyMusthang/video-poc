@@ -3,33 +3,74 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 var (
-	clients   = make(map[*websocket.Conn]bool)
-	broadcast = make(chan Message)
+	clients   = make(map[*websocket.Conn]string)            // conn -> userID
+	rooms     = make(map[string]map[string]*websocket.Conn) // roomID -> (userID -> conn)
+	clientsMu sync.Mutex
+	roomsMu   sync.Mutex
 )
 
 type Message struct {
-	Type string `json:"type"` // "offer", "answer", "candidate"
-	Data string `json:"data"`
+	Type      string      `json:"type"` // "join", "offer", "answer", "candidate", etc.
+	Room      string      `json:"room,omitempty"`
+	From      string      `json:"from,omitempty"`
+	To        string      `json:"to,omitempty"`
+	SDP       interface{} `json:"sdp,omitempty"`
+	ID        string      `json:"id,omitempty"`
+	Candidate interface{} `json:"candidate,omitempty"`
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
-	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
-
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Println("Erro ao fazer upgrade:", err)
 		return
 	}
 	defer conn.Close()
-	clients[conn] = true
-	defer delete(clients, conn)
+
+	// Gera um ID único para este cliente
+	userID := fmt.Sprintf("user-%p", conn)
+
+	clientsMu.Lock()
+	clients[conn] = userID
+	clientsMu.Unlock()
+
+	defer func() {
+		clientsMu.Lock()
+		delete(clients, conn)
+		clientsMu.Unlock()
+
+		// Remove o usuário de todas as salas
+		roomsMu.Lock()
+		for roomID, users := range rooms {
+			if _, ok := users[userID]; ok {
+				delete(rooms[roomID], userID)
+				// Notifica outros usuários que este usuário saiu
+				for _, peerConn := range users {
+					peerConn.WriteJSON(Message{
+						Type: "peer-disconnected",
+						ID:   userID,
+					})
+				}
+			}
+		}
+		roomsMu.Unlock()
+	}()
+
+	// Informa ao cliente seu ID
+	conn.WriteJSON(Message{
+		Type: "init",
+		ID:   userID,
+	})
 
 	for {
 		var msg Message
@@ -37,10 +78,65 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			fmt.Println("Erro ao ler mensagem:", err)
 			break
 		}
-		// Envia a mensagem para todos os outros clientes
-		for client := range clients {
-			if client != conn {
-				client.WriteJSON(msg)
+
+		fmt.Printf("Mensagem recebida: %+v\n", msg)
+
+		switch msg.Type {
+		case "join":
+			roomID := msg.Room
+			if roomID == "" {
+				conn.WriteJSON(Message{
+					Type: "error",
+					ID:   "room-required",
+				})
+				continue
+			}
+
+			roomsMu.Lock()
+			// Cria a sala se não existir
+			if _, ok := rooms[roomID]; !ok {
+				rooms[roomID] = make(map[string]*websocket.Conn)
+			}
+
+			// Adiciona o usuário à sala
+			rooms[roomID][userID] = conn
+
+			// Notifica o usuário sobre os outros participantes na sala
+			for peerID, peerConn := range rooms[roomID] {
+				if peerID != userID {
+					// Informa o novo usuário sobre os pares existentes
+					conn.WriteJSON(Message{
+						Type: "new-peer",
+						ID:   peerID,
+					})
+					// Informa os pares existentes sobre o novo usuário
+					peerConn.WriteJSON(Message{
+						Type: "new-peer",
+						ID:   userID,
+					})
+				}
+			}
+			roomsMu.Unlock()
+
+		case "offer", "answer", "candidate":
+			to := msg.To
+			roomsMu.Lock()
+			// Localiza o destinatário em qualquer sala
+			var targetConn *websocket.Conn
+			for _, users := range rooms {
+				if conn, ok := users[to]; ok {
+					targetConn = conn
+					break
+				}
+			}
+			roomsMu.Unlock()
+
+			if targetConn != nil {
+				// Adiciona o ID do remetente antes de encaminhar
+				msg.From = userID
+				targetConn.WriteJSON(msg)
+			} else {
+				fmt.Println("Destinatário não encontrado:", to)
 			}
 		}
 	}
@@ -51,5 +147,8 @@ func main() {
 	http.HandleFunc("/ws", handleWS)
 
 	fmt.Println("Servidor rodando em http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		fmt.Println("Erro ao iniciar servidor:", err)
+	}
 }

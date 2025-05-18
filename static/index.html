@@ -4,17 +4,83 @@
 <head>
   <title>Reunião WebRTC</title>
   <style>
-    video {
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    .controls {
+      margin-bottom: 20px;
+      padding: 15px;
+      background: #f5f5f5;
+      border-radius: 5px;
+    }
+
+    #videos {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .video-container {
+      position: relative;
       width: 300px;
-      margin: 10px;
+    }
+
+    .video-container video {
+      width: 100%;
+      border-radius: 5px;
+      border: 1px solid #ccc;
+    }
+
+    .video-label {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 3px 8px;
+      border-radius: 3px;
+      font-size: 12px;
+    }
+
+    input,
+    button {
+      padding: 8px;
+      margin-right: 10px;
+    }
+
+    button {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #45a049;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-style: italic;
+      color: #666;
     }
   </style>
 </head>
 
 <body>
   <h2>Reunião WebRTC</h2>
-  <input id="roomInput" placeholder="ID da Sala">
-  <button onclick="joinRoom()">Entrar</button>
+
+  <div class="controls">
+    <input id="roomInput" placeholder="ID da Sala" value="sala1">
+    <button id="joinBtn" onclick="joinRoom()">Entrar na Sala</button>
+    <div class="status" id="status">Desconectado</div>
+  </div>
+
   <div id="videos"></div>
 
   <script>
@@ -22,67 +88,340 @@
     let peers = {}; // peerID -> RTCPeerConnection
     let socket;
     let myID;
+    let currentRoom;
 
-    async function joinRoom() {
-      const room = document.getElementById("roomInput").value;
-      socket = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
+    const iceServers = {
+      iceServers: [
+        {urls: 'stun:stun.l.google.com:19302'},
+        {urls: 'stun:stun1.l.google.com:19302'}
+      ]
+    };
 
-      socket.onopen = async () => {
-        socket.send(JSON.stringify({type: 'join', room}));
-        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
-        addVideoStream('local', localStream);
-      };
+    // Configuração inicial ao carregar a página
+    window.onload = function () {
+      updateStatus('Pronto para conectar');
+    };
 
-      socket.onmessage = async (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'init') {
-          myID = msg.id;
-        } else if (msg.type === 'new-peer') {
-          startConnection(msg.id, true);
-        } else if (msg.type === 'offer') {
-          startConnection(msg.from, false, msg);
-        } else if (msg.type === 'answer') {
-          peers[msg.from].setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        } else if (msg.type === 'candidate') {
-          peers[msg.from].addIceCandidate(new RTCIceCandidate(msg.candidate));
-        }
-      };
+    function updateStatus(message) {
+      document.getElementById('status').textContent = message;
+      console.log(message);
     }
 
-    function addVideoStream(id, stream) {
-      let video = document.getElementById(id);
-      if (!video) {
-        video = document.createElement('video');
-        video.id = id;
+    async function joinRoom() {
+      // Desativa o botão durante a conexão
+      const joinBtn = document.getElementById('joinBtn');
+      joinBtn.disabled = true;
+      joinBtn.textContent = 'Conectando...';
+
+      try {
+        // Obtém o ID da sala
+        currentRoom = document.getElementById("roomInput").value;
+        if (!currentRoom) {
+          alert('Por favor, informe o ID da sala');
+          resetJoinButton();
+          return;
+        }
+
+        updateStatus('Solicitando permissões de mídia...');
+
+        // Solicita acesso à câmera e microfone
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+          addVideoStream('local', localStream, 'Você');
+          updateStatus('Mídia local iniciada');
+        } catch (err) {
+          console.error('Erro ao acessar mídia:', err);
+          alert(`Não foi possível acessar câmera ou microfone: ${err.message}`);
+          resetJoinButton();
+          return;
+        }
+
+        // Inicia a conexão WebSocket
+        updateStatus('Conectando ao servidor...');
+        const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${protocol}://${location.host}/ws`;
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+          updateStatus('Conectado. Entrando na sala: ' + currentRoom);
+          socket.send(JSON.stringify({type: 'join', room: currentRoom}));
+          joinBtn.textContent = 'Conectado';
+        };
+
+        socket.onclose = () => {
+          updateStatus('Desconectado do servidor');
+          resetJoinButton();
+          cleanupPeerConnections();
+        };
+
+        socket.onerror = (error) => {
+          console.error('Erro na conexão WebSocket:', error);
+          updateStatus('Erro na conexão');
+          resetJoinButton();
+        };
+
+        socket.onmessage = handleSocketMessage;
+
+      } catch (err) {
+        console.error('Erro ao entrar na sala:', err);
+        updateStatus('Erro: ' + err.message);
+        resetJoinButton();
+      }
+    }
+
+    function resetJoinButton() {
+      const joinBtn = document.getElementById('joinBtn');
+      joinBtn.disabled = false;
+      joinBtn.textContent = 'Entrar na Sala';
+    }
+
+    function cleanupPeerConnections() {
+      // Fecha todas as conexões peer
+      for (const peerID in peers) {
+        closePeerConnection(peerID);
+      }
+      peers = {};
+
+      // Remove todos os vídeos remotos
+      const videos = document.getElementById('videos');
+      Array.from(videos.children).forEach(container => {
+        if (!container.querySelector('video#local')) {
+          videos.removeChild(container);
+        }
+      });
+    }
+
+    async function handleSocketMessage(event) {
+      try {
+        const msg = JSON.parse(event.data);
+        console.log('Mensagem recebida:', msg);
+
+        switch (msg.type) {
+          case 'init':
+            myID = msg.id;
+            updateStatus('Inicializado com ID: ' + myID);
+            break;
+
+          case 'new-peer':
+            updateStatus('Novo participante detectado: ' + msg.id);
+            // Inicia a conexão com o novo peer sendo o iniciador
+            createPeerConnection(msg.id, true);
+            break;
+
+          case 'peer-disconnected':
+            updateStatus('Participante desconectado: ' + msg.id);
+            closePeerConnection(msg.id);
+            break;
+
+          case 'offer':
+            console.log('Oferta recebida de:', msg.from);
+            // Responde à oferta recebida
+            await handleOffer(msg);
+            break;
+
+          case 'answer':
+            console.log('Resposta recebida de:', msg.from);
+            // Processa a resposta recebida
+            await handleAnswer(msg);
+            break;
+
+          case 'candidate':
+            console.log('Candidato ICE recebido de:', msg.from);
+            // Adiciona o candidato ICE
+            await handleCandidate(msg);
+            break;
+
+          case 'error':
+            console.error('Erro recebido:', msg);
+            updateStatus('Erro: ' + msg.id);
+            break;
+        }
+      } catch (err) {
+        console.error('Erro ao processar mensagem:', err);
+      }
+    }
+
+    function addVideoStream(id, stream, label = id) {
+      // Cria container para o vídeo
+      let container = document.querySelector(`.video-container[data-peer="${id}"]`);
+
+      if (!container) {
+        container = document.createElement('div');
+        container.className = 'video-container';
+        container.dataset.peer = id;
+
+        const video = document.createElement('video');
+        video.id = 'video-' + id;
         video.autoplay = true;
         video.playsInline = true;
-        document.getElementById('videos').appendChild(video);
+        video.muted = (id === 'local'); // Silencia apenas o vídeo local
+        container.appendChild(video);
+
+        const videoLabel = document.createElement('div');
+        videoLabel.className = 'video-label';
+        videoLabel.textContent = label;
+        container.appendChild(videoLabel);
+
+        document.getElementById('videos').appendChild(container);
       }
+
+      const video = container.querySelector('video');
       video.srcObject = stream;
     }
 
-    async function startConnection(peerID, isInitiator, offerMsg = null) {
-      const pc = new RTCPeerConnection();
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    function createPeerConnection(peerID, isInitiator) {
+      // Verifica se já existe uma conexão com este peer
+      if (peers[peerID]) {
+        console.log('Conexão já existe para:', peerID);
+        return peers[peerID];
+      }
 
-      pc.ontrack = (event) => addVideoStream(peerID, event.streams[0]);
+      console.log('Criando nova conexão peer com:', peerID, isInitiator ? '(iniciador)' : '(respondente)');
+
+      // Cria uma nova conexão RTCPeerConnection
+      const pc = new RTCPeerConnection(iceServers);
+      peers[peerID] = pc;
+
+      // Adiciona as trilhas locais à conexão
+      localStream.getTracks().forEach(track => {
+        pc.addTrack(track, localStream);
+      });
+
+      // Manipula eventos da conexão peer
+      pc.ontrack = (event) => {
+        console.log('Trilha recebida de:', peerID);
+        addVideoStream(peerID, event.streams[0], `Participante (${peerID})`);
+      };
+
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          socket.send(JSON.stringify({type: 'candidate', to: peerID, from: myID, candidate: event.candidate}));
+          console.log('Enviando candidato ICE para:', peerID);
+          socket.send(JSON.stringify({
+            type: 'candidate',
+            to: peerID,
+            candidate: event.candidate
+          }));
         }
       };
 
-      peers[peerID] = pc;
+      pc.oniceconnectionstatechange = () => {
+        console.log('Estado da conexão ICE com', peerID, ':', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'disconnected' ||
+          pc.iceConnectionState === 'failed' ||
+          pc.iceConnectionState === 'closed') {
+          closePeerConnection(peerID);
+        }
+      };
 
+      // Se for o iniciador, cria e envia uma oferta
       if (isInitiator) {
-        const offer = await pc.createOffer();
+        createAndSendOffer(peerID, pc);
+      }
+
+      return pc;
+    }
+
+    async function createAndSendOffer(peerID, pc) {
+      try {
+        console.log('Criando oferta para:', peerID);
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true
+        });
+
         await pc.setLocalDescription(offer);
-        socket.send(JSON.stringify({type: 'offer', to: peerID, from: myID, sdp: offer}));
-      } else {
-        await pc.setRemoteDescription(new RTCSessionDescription(offerMsg.sdp));
+        console.log('Definida descrição local (oferta)');
+
+        socket.send(JSON.stringify({
+          type: 'offer',
+          to: peerID,
+          sdp: pc.localDescription
+        }));
+
+        console.log('Oferta enviada para:', peerID);
+      } catch (err) {
+        console.error('Erro ao criar oferta:', err);
+      }
+    }
+
+    async function handleOffer(msg) {
+      const peerID = msg.from;
+
+      try {
+        // Cria uma conexão peer, se necessário
+        const pc = createPeerConnection(peerID, false);
+
+        // Define a descrição remota com a oferta recebida
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        console.log('Definida descrição remota (oferta) de:', peerID);
+
+        // Cria e envia uma resposta
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.send(JSON.stringify({type: 'answer', to: peerID, from: myID, sdp: answer}));
+        console.log('Definida descrição local (resposta)');
+
+        socket.send(JSON.stringify({
+          type: 'answer',
+          to: peerID,
+          sdp: pc.localDescription
+        }));
+
+        console.log('Resposta enviada para:', peerID);
+      } catch (err) {
+        console.error('Erro ao processar oferta:', err);
+      }
+    }
+
+    async function handleAnswer(msg) {
+      const peerID = msg.from;
+      const pc = peers[peerID];
+
+      if (pc) {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          console.log('Definida descrição remota (resposta) de:', peerID);
+        } catch (err) {
+          console.error('Erro ao processar resposta:', err);
+        }
+      } else {
+        console.warn('Conexão peer não encontrada para:', peerID);
+      }
+    }
+
+    async function handleCandidate(msg) {
+      const peerID = msg.from;
+      const pc = peers[peerID];
+
+      if (pc) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          console.log('Candidato ICE adicionado de:', peerID);
+        } catch (err) {
+          console.error('Erro ao adicionar candidato ICE:', err);
+        }
+      } else {
+        console.warn('Conexão peer não encontrada para candidato de:', peerID);
+      }
+    }
+
+    function closePeerConnection(peerID) {
+      console.log('Fechando conexão com:', peerID);
+
+      const pc = peers[peerID];
+      if (pc) {
+        pc.ontrack = null;
+        pc.onicecandidate = null;
+        pc.oniceconnectionstatechange = null;
+
+        // Fecha a conexão
+        pc.close();
+        delete peers[peerID];
+      }
+
+      // Remove o vídeo
+      const container = document.querySelector(`.video-container[data-peer="${peerID}"]`);
+      if (container) {
+        document.getElementById('videos').removeChild(container);
       }
     }
   </script>
