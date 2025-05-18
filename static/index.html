@@ -2,70 +2,89 @@
 <html>
 
 <head>
-  <title>Chamada 2 Pessoas</title>
+  <title>Reunião WebRTC</title>
+  <style>
+    video {
+      width: 300px;
+      margin: 10px;
+    }
+  </style>
 </head>
 
 <body>
-  <h1>Chamada de Vídeo</h1>
-  <video id="local" autoplay playsinline muted></video>
-  <video id="remote" autoplay playsinline></video>
+  <h2>Reunião WebRTC</h2>
+  <input id="roomInput" placeholder="ID da Sala">
+  <button onclick="joinRoom()">Entrar</button>
+  <div id="videos"></div>
 
   <script>
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        {urls: "stun:stun.l.google.com:19302"}  // STUN público do Google
-      ]
-    });
-    const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${protocol}://${location.host}/ws`);
-    const localVideo = document.getElementById('local');
-    const remoteVideo = document.getElementById('remote');
+    let localStream;
+    let peers = {}; // peerID -> RTCPeerConnection
+    let socket;
+    let myID;
 
-    navigator.mediaDevices.getUserMedia({video: true, audio: true})
-      .then(stream => {
-        localVideo.srcObject = stream;
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-      });
+    async function joinRoom() {
+      const room = document.getElementById("roomInput").value;
+      socket = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
 
-    pc.ontrack = event => {
-      remoteVideo.srcObject = event.streams[0];
-    };
+      socket.onopen = async () => {
+        socket.send(JSON.stringify({type: 'join', room}));
+        localStream = await navigator.mediaDevices.getUserMedia({video: true, audio: true});
+        addVideoStream('local', localStream);
+      };
 
-    pc.onicecandidate = event => {
-      if (event.candidate) {
-        ws.send(JSON.stringify({type: "candidate", data: JSON.stringify(event.candidate)}));
+      socket.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'init') {
+          myID = msg.id;
+        } else if (msg.type === 'new-peer') {
+          startConnection(msg.id, true);
+        } else if (msg.type === 'offer') {
+          startConnection(msg.from, false, msg);
+        } else if (msg.type === 'answer') {
+          peers[msg.from].setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        } else if (msg.type === 'candidate') {
+          peers[msg.from].addIceCandidate(new RTCIceCandidate(msg.candidate));
+        }
+      };
+    }
+
+    function addVideoStream(id, stream) {
+      let video = document.getElementById(id);
+      if (!video) {
+        video = document.createElement('video');
+        video.id = id;
+        video.autoplay = true;
+        video.playsInline = true;
+        document.getElementById('videos').appendChild(video);
       }
-    };
+      video.srcObject = stream;
+    }
 
-    ws.onmessage = async ({data}) => {
-      const msg = JSON.parse(data);
+    async function startConnection(peerID, isInitiator, offerMsg = null) {
+      const pc = new RTCPeerConnection();
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-      if (msg.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data)));
+      pc.ontrack = (event) => addVideoStream(peerID, event.streams[0]);
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.send(JSON.stringify({type: 'candidate', to: peerID, from: myID, candidate: event.candidate}));
+        }
+      };
+
+      peers[peerID] = pc;
+
+      if (isInitiator) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.send(JSON.stringify({type: 'offer', to: peerID, from: myID, sdp: offer}));
+      } else {
+        await pc.setRemoteDescription(new RTCSessionDescription(offerMsg.sdp));
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        ws.send(JSON.stringify({type: "answer", data: JSON.stringify(answer)}));
+        socket.send(JSON.stringify({type: 'answer', to: peerID, from: myID, sdp: answer}));
       }
-
-      if (msg.type === "answer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(msg.data)));
-      }
-
-      if (msg.type === "candidate") {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(JSON.parse(msg.data)));
-        } catch (e) {
-          console.error("Erro ao adicionar ICE:", e);
-        }
-      }
-    };
-
-    // Primeiro cliente inicia a oferta
-    ws.onopen = async () => {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({type: "offer", data: JSON.stringify(offer)}));
-    };
+    }
   </script>
 </body>
 
